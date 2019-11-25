@@ -1,0 +1,30 @@
+# Zufs configuration file, Makefile syntax.
+# This file, in turn is included by the top-level Makfile
+#
+# Copy into ${ZUSDIR}/.config to let top Makefile include it
+#
+
+# Edit for the Kernel you are working with.
+# Default: /usr/src/kernel/$(uname -r)/
+ZUF_KERN_DIR=../zuf/
+
+# Uncomment in case kernel is built with 'O=.build'
+#ZUF_KERN_BUILD_DIR = ../zuf/.build
+
+# Enable debugging info Master switch
+DEBUG=1
+
+# Set optimization level (unset, will default to 2)
+# CONFIG_OPTIMIZE_LEVEL = 0
+
+# Try Using Anonymous mmap
+CONFIG_TRY_ANON_MMAP = 1
+
+# Control path zus-zuf
+CONFIG_ZUF_DEF_PATH = /sys/fs/zuf
+
+# Verbose build output
+CONFIG_BUILD_VERBOSE = 0
+
+# List of filesystems to build
+CONFIG_LIBFS_MODULES = pmfs2
