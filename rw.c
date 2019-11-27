@@ -103,7 +103,7 @@ ssize_t pmfs2_rw_write_iter(struct super_block *sb, struct inode *inode,
 	loff_t pos = start;
 	ulong index = pmfs2_o2b(pos);
 	unsigned int offset = pos & (PMFS2_BLOCK_SIZE - 1);
-	int err;
+	int err = 0;
 
 	while (iov_iter_count(ii)) {
 		struct pmfs2_gbi gbi = { .iomb = &ii->iomb };
@@ -166,7 +166,7 @@ ssize_t pmfs2_rw_get_multy_write(struct super_block *sb, struct inode *inode,
 	ulong index = pmfs2_o2b(pos);
 	uint offset = pos & (PMFS2_BLOCK_SIZE - 1);
 	bool done_alloc = false;
-	int err;
+	int err = 0;
 
 	_zus_iom_start(&ii->iomb, NULL, NULL);
 
