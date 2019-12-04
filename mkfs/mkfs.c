@@ -21,18 +21,23 @@
 #include "zus.h"
 #include "pmfs2.h"
 
+struct pmfs2_pdev_info {
+	char *path;
+	uuid_t uuid;
+	loff_t size;
+	ulong blocks;
+	short index;
+	int fd;
+};
 
-/* globals */
-static const char *g_dev_path;
-static uuid_t g_super_uuid;
-static uuid_t g_dev_uuid;
-
-static void _init_globals(const char *dev_path)
-{
-	g_dev_path = dev_path;
-	uuid_generate(g_super_uuid);
-	uuid_generate(g_dev_uuid);
-}
+struct pmfs2_mkfs_info {
+	struct timespec now;
+	uuid_t super_uuid;
+	ulong t1_blocks;
+	ushort version;
+	int ndevs;
+	struct pmfs2_pdev_info pdi[MD_DEV_MAX];
+};
 
 
 static union pmfs2_meta_block *_alloc_meta_block(void)
@@ -63,12 +68,11 @@ static void _free_super_block(struct pmfs2_super_block *sb)
 	_free_meta_block(container_of(sb, union pmfs2_meta_block, sb));
 }
 
-static int _open_blkdev(loff_t *sz)
+static int _open_blkdev(const char *path, loff_t *sz)
 {
 	int fd, err;
 	size_t bdev_size = 0, min_size = 1UL << 20;
 	struct stat st;
-	const char *path = g_dev_path;
 
 	fd = open(path, O_RDWR);
 	if (fd <= 0)
@@ -93,10 +97,9 @@ static int _open_blkdev(loff_t *sz)
 	return fd;
 }
 
-static void _close_blkdev(int fd)
+static void _close_blkdev(const char *path, int fd)
 {
 	int err;
-	const char *path = g_dev_path;
 
 	err = fsync(fd);
 	if (err)
@@ -104,91 +107,175 @@ static void _close_blkdev(int fd)
 	close(fd);
 }
 
-static void _fill_itable(struct pmfs2_inode *it_pi)
+static void _fill_itable(struct pmfs2_inode *it_pi, struct pmfs2_mkfs_info *mki)
 {
-	struct timespec now;
-
-	clock_gettime(CLOCK_REALTIME, &now);
 	memset(it_pi, 0, sizeof(*it_pi));
 	it_pi->i_mode = cpu_to_le16(0755);
 	it_pi->i_uid = cpu_to_le32(geteuid());
 	it_pi->i_gid = cpu_to_le32(getegid());
-	pmfs2_timespec_to_le64(&it_pi->i_atime, &now);
-	pmfs2_timespec_to_le64(&it_pi->i_mtime, &now);
-	pmfs2_timespec_to_le64(&it_pi->i_ctime, &now);
+	pmfs2_timespec_to_le64(&it_pi->i_atime, &mki->now);
+	pmfs2_timespec_to_le64(&it_pi->i_mtime, &mki->now);
+	pmfs2_timespec_to_le64(&it_pi->i_ctime, &mki->now);
 }
 
-static void _fill_mdt(struct md_dev_table *mdt, ulong t1_blocks)
+static void _fill_mdt(struct md_dev_table *mdt, struct pmfs2_mkfs_info *mki)
 {
-	struct timespec now;
-	struct md_dev_id *dev_id;
-	ushort version = (PMFS2_MAJOR_VERSION * ZUFS_MINORS_PER_MAJOR) +
-			 PMFS2_MINOR_VERSION;
-
 	memset(mdt, 0, sizeof(*mdt));
-	memcpy(&mdt->s_uuid, g_super_uuid, sizeof(mdt->s_uuid));
-	mdt->s_version = cpu_to_le16(version);
+	memcpy(&mdt->s_uuid, mki->super_uuid, sizeof(mdt->s_uuid));
+	mdt->s_version = cpu_to_le16(mki->version);
 	mdt->s_magic = cpu_to_le32(PMFS2_SUPER_MAGIC);
 	mdt->s_flags = cpu_to_le64(0);
-	mdt->s_t1_blocks = cpu_to_le64(t1_blocks);
-	mdt->s_dev_list.id_index = cpu_to_le16(0);
-	mdt->s_dev_list.t1_count = cpu_to_le16(1);
+	mdt->s_t1_blocks = cpu_to_le64(mki->t1_blocks);
+	mdt->s_dev_list.t1_count = cpu_to_le16(mki->ndevs);
+	timespec_to_zt(&mdt->s_wtime, &mki->now);
+}
 
-	dev_id = &mdt->s_dev_list.dev_ids[0];
-	memcpy(&dev_id->uuid, g_dev_uuid, sizeof(dev_id->uuid));
-	dev_id->blocks = mdt->s_t1_blocks;
+static void _update_mdt_dev(struct md_dev_table *mdt,
+			    struct pmfs2_mkfs_info *mki, short dev_index)
+{
+	struct md_dev_id *dev_id = &mdt->s_dev_list.dev_ids[dev_index];
+	struct pmfs2_pdev_info *pdi = &mki->pdi[dev_index];
 
-	clock_gettime(CLOCK_REALTIME, &now);
-	timespec_to_zt(&mdt->s_wtime, &now);
+	memcpy(&dev_id->uuid, pdi->uuid, sizeof(dev_id->uuid));
+	dev_id->blocks = cpu_to_le64(pdi->blocks);
+}
+
+static void _restamp_mdt(struct md_dev_table *mdt)
+{
 	mdt->s_sum = cpu_to_le16(md_calc_csum(mdt));
 }
 
-static ulong _device_t1_blocks(loff_t dev_size)
+static void _fill_super_block(struct pmfs2_mkfs_info *mki,
+			      struct pmfs2_super_block *sb)
+{
+	_fill_mdt(&sb->s_mdt, mki);
+	_fill_itable(&sb->s_itable, mki);
+}
+
+static ulong _size_to_t1_blocks(loff_t dev_size)
 {
 	ulong align_mask = ZUFS_ALLOC_MASK;
 
 	return md_o2p(dev_size & ~align_mask);
 }
 
-static void _fill_super_block(struct pmfs2_super_block *sb, ulong t1_blocks)
+static struct pmfs2_mkfs_info *_init_mkfs_info(char *devs[], int ndevs)
 {
-	_fill_mdt(&sb->s_mdt, t1_blocks);
-	_fill_itable(&sb->s_itable);
+	int i;
+	struct pmfs2_mkfs_info *mki;
+
+	mki = pmfs2_calloc(1, sizeof(*mki));
+	if (unlikely(!mki))
+		error(EXIT_FAILURE, -errno, "alloc failure");
+
+	clock_gettime(CLOCK_REALTIME, &mki->now);
+	uuid_generate(mki->super_uuid);
+	mki->version = (PMFS2_MAJOR_VERSION * ZUFS_MINORS_PER_MAJOR) +
+			PMFS2_MINOR_VERSION;
+
+	for (i = 0; i < ndevs; ++i) {
+		struct pmfs2_pdev_info *pdi = &mki->pdi[i];
+
+		uuid_generate(pdi->uuid);
+		pdi->path = realpath(devs[i], NULL);
+		if (unlikely(!pdi->path))
+			error(EXIT_FAILURE, 0, "no realpath: %s", devs[i]);
+
+		pdi->index = i;
+		pdi->fd = _open_blkdev(pdi->path, &pdi->size);
+		pdi->blocks = _size_to_t1_blocks(pdi->size);
+		mki->t1_blocks += pdi->blocks;
+	}
+	mki->ndevs = ndevs;
+	return mki;
 }
 
-static void _write_super_block(int fd, const struct pmfs2_super_block *sb)
+static void _fini_mkfs_info(struct pmfs2_mkfs_info *mki)
 {
-	int err;
-	size_t bsz = PMFS2_BLOCK_SIZE;
+	int i;
 
-	err = pwrite(fd, sb, bsz, 0);
-	if (err != (int)bsz)
-		error(EXIT_FAILURE, -errno, "failed to write super block");
+	for (i = 0; i < mki->ndevs; ++i) {
+		_close_blkdev(mki->pdi[i].path, mki->pdi[i].fd);
+		free(mki->pdi[i].path);
+	}
+	pmfs2_free(mki);
+}
+
+static void _update_mdt_devs(struct pmfs2_mkfs_info *mki,
+			     struct pmfs2_super_block *sb)
+{
+	int i;
+
+	for (i = 0; i < mki->ndevs; ++i) {
+		_update_mdt_dev(&sb->s_mdt, mki, (short)i);
+	}
+}
+
+static void _write_super_blocks(struct pmfs2_mkfs_info *mki,
+				struct pmfs2_super_block *sb)
+{
+	int i, err;
+
+	for (i = 0; i < mki->ndevs; ++i) {
+		_restamp_mdt(&sb->s_mdt);
+		err = pwrite(mki->pdi[i].fd, sb, PMFS2_BLOCK_SIZE, 0);
+		if (err != (int)PMFS2_BLOCK_SIZE)
+			error(EXIT_FAILURE, -errno, "failed to write sb");
+	}
+}
+
+/*
+ * Hackish code to add proper symbolic-links when operating in multi-device
+ * mode. Unfortunately, it does not  reboot.
+ *
+ * TODO: use udev rules
+ */
+static void _setup_by_uuid_symlink(struct pmfs2_mkfs_info *mki)
+{
+	int i;
+	size_t len;
+	char uu[40];
+	char linkpath[256] = "/dev/disk/by-uuid/";
+
+	if (mki->ndevs <= 1)
+		return;
+
+	len = strlen(linkpath);
+	for (i = 0; i < mki->ndevs; ++i) {
+		uuid_unparse(mki->pdi[i].uuid, uu);
+
+		linkpath[len] = '\0';
+		strcat(linkpath + len, uu);
+		symlink(mki->pdi[i].path, linkpath);
+	}
 }
 
 int main(int argc, char *argv[])
 {
-	int err, fd;
-	loff_t dev_size = 0;
+	int err;
+	struct pmfs2_mkfs_info *mki;
 	struct pmfs2_super_block *sb;
 
-	if (argc != 2)
-		error(EXIT_FAILURE, -1, "usage: mkfs <device-path>");
+	if (argc < 2)
+		error(EXIT_FAILURE, -1, "usage: mkfs <pmem0> [<pmem1>...]");
+
+	if ((argc - 1) > MD_DEV_MAX)
+		error(EXIT_FAILURE, -1, "too many devices");
 
 	err = zus_slab_init();
 	if (unlikely(err))
 		error(EXIT_FAILURE, -1, "slab init failed");
 
-	_init_globals(argv[1]);
-	fd = _open_blkdev(&dev_size);
-
+	mki = _init_mkfs_info(argv + 1, argc - 1);
 	sb = _alloc_super_block();
-	_fill_super_block(sb, _device_t1_blocks(dev_size));
 
-	_write_super_block(fd, sb);
-	_close_blkdev(fd);
+	_fill_super_block(mki, sb);
+	_update_mdt_devs(mki, sb);
+	_write_super_blocks(mki, sb);
+	_setup_by_uuid_symlink(mki);
 
 	_free_super_block(sb);
+	_fini_mkfs_info(mki);
 	zus_slab_fini();
 
 	return 0;
