@@ -141,26 +141,36 @@ static inline void _root_zii_fini(struct zus_sb_info *sbi)
  */
 static int _verify_pmem(struct zus_sb_info *zsbi)
 {
+	int i, nnodes;
 	cpu_set_t cpuset;
 	struct multi_devices *md = &zsbi->md;
 	struct md_dev_info *mdi;
 	struct zufs_ioc_numa_map *numa_map = zus_numa_map;
 
-	if (md->t1_count != 1) {
+	if (unlikely(md->t2_count)) {
+		pmfs2_warn("unsupported t2_count=%d\n", md->t2_count);
+		return -EINVAL;
+	}
+
+	if (unlikely(!md->t1_count || md->t1_count > MD_DEV_MAX)) {
 		pmfs2_warn("unsupported t1_count=%d\n", md->t1_count);
 		return -EINVAL;
 	}
 
-	mdi = md_t1_dev(md, 0);
-	if ((mdi->nid < 0) || (mdi->nid >= (int)numa_map->possible_nodes)) {
-		pmfs2_warn("illegal nodeid=%d\n", mdi->nid);
-		return -EINVAL;
-	}
+	nnodes = (int)numa_map->possible_nodes;
+	for (i = 0; i < md->t1_count; ++i) {
+		mdi = md_t1_dev(md, 1);
+		if ((mdi->nid < 0) || (mdi->nid >= nnodes)) {
+			pmfs2_warn("illegal nodeid=%d\n", mdi->nid);
+			return -EINVAL;
+		}
 
-	memcpy(&cpuset, &numa_map->cpu_set_per_node[mdi->nid], sizeof(cpuset));
-	if (!CPU_COUNT(&cpuset)) {
-		pmfs2_warn("no active CPU on nodeid=%d\n", mdi->nid);
-		return -EINVAL;
+		memcpy(&cpuset, &numa_map->cpu_set_per_node[mdi->nid],
+			sizeof(cpuset));
+		if (!CPU_COUNT(&cpuset)) {
+			pmfs2_warn("no active CPU on nodeid=%d\n", mdi->nid);
+			return -EINVAL;
+		}
 	}
 	return 0;
 }

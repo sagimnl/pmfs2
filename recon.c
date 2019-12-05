@@ -19,6 +19,26 @@ static void _init_recon_info(struct pmfs2_recon_info *pri,
 	pri->num_inodes = 0;
 }
 
+/*
+ * The first of each PMEM device is reserved for MDT and therefore must marked
+ * as active.
+ */
+static int _recon_mdt_pages(struct pmfs2_recon_info *pri)
+{
+	int i, err;
+	struct multi_devices *md = pri->sbi->md;
+
+	for (i = 0; i < md->t1_count; ++i) {
+		struct md_dev_info *mdi = md_t1_dev(md, i);
+		ulong reserved_bn = pmfs2_o2b(mdi->offset);
+
+		err = pmfs2_mark_bn_active(pri->sb, reserved_bn);
+		if (unlikely(err))
+			return err;
+	}
+	return 0;
+}
+
 static int _recon_itable_root(struct pmfs2_recon_info *pri)
 {
 	struct pmfs2_inode *it_pi, *root_pi;
@@ -71,7 +91,6 @@ static int _recon_inodes(struct pmfs2_recon_info *pri)
 			err = pmfs2_pi_recon(pri->sb, pi);
 		else
 			pmfs2_enq_free_inode(pri->sb, pi);
-
 	}
 	return err;
 }
@@ -82,6 +101,10 @@ int pmfs2_reconstruct(struct super_block *sb, struct inode *root_i)
 	int err;
 
 	_init_recon_info(&pri, sb, root_i);
+
+	err = _recon_mdt_pages(&pri);
+	if (unlikely(err))
+		return err;
 
 	err = _recon_itable_root(&pri);
 	if (unlikely(err))
